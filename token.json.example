@@ -1,0 +1,10 @@
+{
+  "tokens": [
+    {
+      "name": "account-1",
+      "accessToken": "your-cursor-access-token-here",
+      "machineId": "your-machine-id-here",
+      "macMachineId": "your-mac-machine-id-here"
+    }
+  ]
+}
