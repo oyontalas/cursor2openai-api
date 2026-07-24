@@ -193,7 +193,6 @@ for chunk in resp:
 | `DEFAULT_MODEL` | `claude-4.5-sonnet` | 默认 Cursor 模型 |
 | `CURSOR_CLIENT_VERSION` | `3.12.17` | Cursor 客户端版本号 (需跟上游保持较新, 太旧会被拒 "Update Required") |
 | `REQUEST_TIMEOUT` | `120000` | 请求超时 (ms) |
-| `LOG_PREVIEW_LEN` | `2000` | 终端里每次调用打印的 prompt/响应内容预览长度 (字符数)，超出会截断；只打印到终端，不写文件 |
 
 以下变量只影响 **Agent 工具调用**（Copilot 这类会声明 `tools` 的客户端），普通聊天完全不受影响：
 

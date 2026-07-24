@@ -133,23 +133,6 @@ function toolMessageContentText(m) {
   try { return JSON.stringify(m.content); } catch { return String(m.content); }
 }
 
-// 取消息数组里最后一条 role=user 的文本内容 (相比拼好的完整 prompt, 这是终端打印时更有信息量的部分,
-// 系统提示词/历史消息通常又长又是重复的样板文字)
-function lastUserContent(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === 'user') return toolMessageContentText(messages[i]);
-  }
-  return '';
-}
-
-// 终端打印用的内容预览: 每次调用相关内容留痕在终端里 (不写文件), 太长的截断并标注总长度
-const LOG_PREVIEW_LEN = parseInt(process.env.LOG_PREVIEW_LEN || '2000');
-function preview(text, max = LOG_PREVIEW_LEN) {
-  const s = String(text || '');
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}\n  … [截断, 共 ${s.length} 字符]`;
-}
-
 // ── POST /v1/chat/completions ──
 app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
   const { messages, model, stream, tools } = req.body;
@@ -177,10 +160,8 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
 
   if (isToolContinuation) {
     console.log(`  🔧 [${new Date().toLocaleTimeString()}] tool result ← ${toolMsg.tool_call_id}`);
-    console.log(`     ${preview(toolMessageContentText(toolMsg)).replace(/\n/g, '\n     ')}`);
   } else {
     console.log(`  📨 [${new Date().toLocaleTimeString()}] ${requestedModel} → ${cursorModel} | stream=${isStream}${bridgeTools ? ' | bridgeTools=on' : ''} | prompt=${prompt.length}字符`);
-    console.log(`     ${preview(lastUserContent(messages)).replace(/\n/g, '\n     ')}`);
   }
 
   // 统一发起/恢复调用, 返回 { type: 'final', ... } 或 { type: 'tool_calls', toolCalls, sessionId }
@@ -250,8 +231,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
 
       if (result.type === 'tool_calls') {
         finishToolCalls(result.toolCalls);
-        console.log(`  🛠️  stream paused for tool_calls:`);
-        for (const tc of result.toolCalls) console.log(`     ${tc.name}(${preview(tc.arguments, 500)})`);
+        console.log(`  🛠️  stream paused for tool_calls: ${result.toolCalls.map(tc => tc.name).join(', ')}`);
         return;
       }
 
@@ -263,8 +243,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
       if (result.error) {
         console.log(`  ⚠️ stream finished with error: ${result.error} | in=${result.inputTokens} out=${result.outputTokens}`);
       } else {
-        console.log(`  ✅ stream done | in=${result.inputTokens} out=${result.outputTokens}`);
-        console.log(`     ${preview(streamedText).replace(/\n/g, '\n     ')}`);
+        console.log(`  ✅ stream done | in=${result.inputTokens} out=${result.outputTokens} out_len=${streamedText.length}字符`);
       }
     } catch (e) {
       if (e.message === 'Request aborted') {
@@ -285,8 +264,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
       const result = await runTurn({ stream: false });
 
       if (result.type === 'tool_calls') {
-        console.log(`  🛠️  paused for tool_calls:`);
-        for (const tc of result.toolCalls) console.log(`     ${tc.name}(${preview(tc.arguments, 500)})`);
+        console.log(`  🛠️  paused for tool_calls: ${result.toolCalls.map(tc => tc.name).join(', ')}`);
         return res.json(converter.buildToolCallChatResponse(result.toolCalls, cursorModel));
       }
 
@@ -295,8 +273,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
         return res.status(500).json(converter.buildErrorResponse(result.error));
       }
 
-      console.log(`  ✅ done | in=${result.inputTokens} out=${result.outputTokens}`);
-      console.log(`     ${preview(result.text).replace(/\n/g, '\n     ')}`);
+      console.log(`  ✅ done | in=${result.inputTokens} out=${result.outputTokens} out_len=${result.text.length}字符`);
       res.json(converter.buildChatResponse(result.text, cursorModel, result.inputTokens, result.outputTokens));
     } catch (e) {
       console.error(`  ❌ ${e.message}`);
