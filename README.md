@@ -270,4 +270,4 @@ VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里�
 
 ---
 
-<sub>本仓库修改自 [oyontalas/cursoride2api](https://github.com/oyontalas/cursoride2api.git)。</sub>
+<sub>本仓库修改自 [sdsdsdsdsdsihdkjsdjl/cursoride2api](https://github.com/sdsdsdsdsdsihdkjsdjl/cursoride2api)。</sub>
