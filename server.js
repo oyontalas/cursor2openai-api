@@ -156,10 +156,22 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
   const toolMsg = isToolContinuation ? trailingToolMsgs[0] : null;
   const bridgeTools = BRIDGE_TOOLS && Array.isArray(tools) && tools.length > 0;
 
-  const prompt = isToolContinuation ? '' : converter.messagesToPrompt(messages);
+  // shell/shellStream 类型的桥接工具调用, 在原 Cursor 会话里续接目前是卡死的 (后端不认可我们的
+  // shellStream 回复, 只会一直心跳直到兜底超时), 硬等下去只会把整段 agent 对话强行截断成一句
+  // "这是命令输出" 就收尾, 模型自己根本没机会看到结果、决定下一步。已过期/已被处理的 pendingBridge
+  // (peekPendingBridgeKind 返回 null) 同理不该再走 resumeToolCall 直接报错。
+  // 这两种情况都改成放弃原会话, 带着完整对话历史 (含刚发生的工具调用与结果) 开一个全新会话续接,
+  // 让模型在一个正常工作的新会话里真正理解发生了什么并继续任务。只有确认还是 'write' 类型 (已验证
+  // 续接可靠) 才走原会话的 resumeToolCall。
+  const pendingKind = isToolContinuation ? cursorClient.peekPendingBridgeKind(toolMsg.tool_call_id) : null;
+  const useFreshSessionForContinuation = isToolContinuation && pendingKind !== 'write';
+
+  const prompt = (!isToolContinuation || useFreshSessionForContinuation) ? converter.messagesToPrompt(messages) : '';
 
   if (isToolContinuation) {
-    console.log(`  🔧 [${new Date().toLocaleTimeString()}] tool result ← ${toolMsg.tool_call_id}`);
+    const via = useFreshSessionForContinuation ? `开新会话续接 (原类型: ${pendingKind || '已过期'})` : '原会话续接';
+    const promptInfo = useFreshSessionForContinuation ? ` | prompt=${prompt.length}字符` : '';
+    console.log(`  🔧 [${new Date().toLocaleTimeString()}] tool result ← ${toolMsg.tool_call_id} | ${via}${promptInfo}`);
   } else {
     console.log(`  📨 [${new Date().toLocaleTimeString()}] ${requestedModel} → ${cursorModel} | stream=${isStream}${bridgeTools ? ' | bridgeTools=on' : ''} | prompt=${prompt.length}字符`);
   }
@@ -167,7 +179,16 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
   // 统一发起/恢复调用, 返回 { type: 'final', ... } 或 { type: 'tool_calls', toolCalls, sessionId }
   function runTurn(runtimeOptions) {
     if (isToolContinuation) {
-      return cursorClient.resumeToolCall(toolMsg.tool_call_id, toolMessageContentText(toolMsg), runtimeOptions);
+      if (useFreshSessionForContinuation) {
+        if (pendingKind) cursorClient.discardPendingBridge(toolMsg.tool_call_id);
+        return cursorClient.chat(token, prompt, cursorModel, { ...runtimeOptions, bridgeTools });
+      }
+      return cursorClient.resumeToolCall(toolMsg.tool_call_id, toolMessageContentText(toolMsg), runtimeOptions)
+        .catch((err) => {
+          // 保底: 就算判断是 'write' 类型, 真续接时也可能因为竞态等原因失败, 同样别让整个对话报错中断
+          console.log(`  ↩️  resumeToolCall 失败 (${err.message}), 改为开新会话续接完整上下文`);
+          return cursorClient.chat(token, converter.messagesToPrompt(messages), cursorModel, { ...runtimeOptions, bridgeTools });
+        });
     }
     return cursorClient.chat(token, prompt, cursorModel, { ...runtimeOptions, bridgeTools });
   }

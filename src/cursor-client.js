@@ -82,6 +82,20 @@ const ENABLE_SHELL = /^(1|true|yes|on)$/i.test(process.env.ENABLE_SHELL || '');
 const SHELL_TIMEOUT_MS = parseInt(process.env.SHELL_TIMEOUT_MS || '120000');
 const SHELL_MAX_OUTPUT_BYTES = parseInt(process.env.SHELL_MAX_OUTPUT_BYTES || '200000');
 
+// 首字超时: 实测 "放弃卡死会话, 带完整历史开新会话续接" 场景下, prompt 会随着工具调用轮数
+// 越滚越大 (曾在一次 arxiv-paper-qa 任务里从 28K 字符涨到 46K 字符), Cursor 后端处理这么长的
+// prompt、给出第一个响应字符所需时间也随之变长, 固定 60s 首字超时在长 prompt 下会被真实触发
+// (报错 "First stream chunk timeout"), 把整段 agent 对话强行截断。这里改成随 prompt 长度自适应
+// 拉长超时上限 (同时设置绝对上限, 避免调用方一直挂着白等)。
+const STREAM_FIRST_CHUNK_BASE_MS = parseInt(process.env.STREAM_FIRST_CHUNK_TIMEOUT || '90000');
+const STREAM_FIRST_CHUNK_MAX_MS = parseInt(process.env.STREAM_FIRST_CHUNK_TIMEOUT_MAX || '300000');
+const STREAM_FIRST_CHUNK_MS_PER_CHAR = parseFloat(process.env.STREAM_FIRST_CHUNK_MS_PER_CHAR || '2');
+
+function computeFirstChunkTimeoutMs(promptLength) {
+  const adaptive = STREAM_FIRST_CHUNK_BASE_MS + Math.round((promptLength || 0) * STREAM_FIRST_CHUNK_MS_PER_CHAR);
+  return Math.min(adaptive, STREAM_FIRST_CHUNK_MAX_MS);
+}
+
 // shell 的 cwd 有意不像 read/write 那样限制在 WORKSPACE_ROOT 内: 开 ENABLE_SHELL 本身就等于
 // 给了模型完整本机 shell 权限 (脚本内 cd/读写任意路径都拦不住), 限制 cwd 只会导致真实客户端
 // (如 VSCode) 传来的实际工作目录被静默改写成 WORKSPACE_ROOT, 命令跑错地方却毫无提示。
@@ -517,7 +531,11 @@ function handleExecMessage(exec, writeFrame, session = null) {
 // ── 会话注册表 (支持跨多次 HTTP 请求恢复同一条 Cursor 双向流) ──
 const sessions = new Map();          // sessionId -> session
 const toolCallOwner = new Map();     // toolCallId -> sessionId
-const SESSION_ABANDON_MS = parseInt(process.env.BRIDGE_SESSION_TIMEOUT || '600000'); // 10分钟无人恢复则回收
+// 桥接的 tool_calls (尤其是 shell) 交还客户端后, 通常需要真人在 IDE 里点一下"允许执行此命令?"
+// 确认框才会继续——这是完全合理的、可能长达几分钟甚至更久的等待, 不是网络卡住或模型没反应,
+// 不应该被当成"超时"处理掉。所以这里给得比较宽松, 而且即使真的到了这个时限也不会报错中断
+// 对话 (见 armAbandonGuard 的注释), 只是用来回收长期没人确认的会话占用的内存。
+const SESSION_ABANDON_MS = parseInt(process.env.BRIDGE_SESSION_TIMEOUT || '1800000'); // 默认 30 分钟无人确认则回收
 
 function destroySession(session) {
   if (session.destroyed) return;
@@ -537,6 +555,12 @@ function destroySession(session) {
   if (session.pendingBridge) toolCallOwner.delete(session.pendingBridge.toolCallId);
 }
 
+// 注意: 这个计时器到点后只是 destroySession() 回收内存/关闭底层连接, 完全不会调用 session.resolve/
+// reject —— 因为 pauseSession() 早就把 resolve/reject 交还给调用方了 (那次 HTTP 请求早已经正常
+// 结束、返回了 tool_calls), 这里没有"正在等待的 Promise"可失败。等真人确认完、真的发起
+// resumeToolCall() 时, 如果这个会话已经被回收, peekPendingBridgeKind 会返回 null, server.js
+// 会据此自动改用"开新会话续接完整历史"兜底, 而不是报错——所以这个时限设长一点、短一点都不会
+// 造成用户可见的失败, 纯粹是内存回收的时间窗口。
 function armAbandonGuard(session) {
   if (session.abandonTimer) clearTimeout(session.abandonTimer);
   session.abandonTimer = setTimeout(() => {
@@ -583,6 +607,14 @@ function clearShellFallback(session) {
  * @param {Object} options - { conversationId, stream, onDelta, onThinking, signal, bridgeTools }
  * @returns {Promise<{ type: 'final', text, inputTokens, outputTokens, thinkingMs, error } | { type: 'tool_calls', toolCalls, sessionId }>}
  */
+// 建立到 Cursor 后端的连接在真正开始交互前失败 (比如 TLS 握手途中被打断、DNS/网络抖动),
+// 属于纯粹的网络问题, 跟"模型没反应"或"人还没确认"完全是两码事——重试一下往往就好了,
+// 没必要直接把整个任务判失败甩给调用方去手动重试。这里只在"这次连接从头到尾没收到过任何
+// 真实进展"时才允许自动重试几次, 一旦已经有过任何 sawTextDelta / pendingBridge / fullText,
+// 说明连接是正常的、只是后来才出问题, 就不再重试 (避免把已经真实发生过的操作重复一遍)。
+const CONNECT_RETRY_COUNT = parseInt(process.env.CONNECT_RETRY_COUNT || '2');
+const CONNECT_RETRY_DELAY_MS = parseInt(process.env.CONNECT_RETRY_DELAY_MS || '600');
+
 function chat(token, prompt, modelId, options = {}) {
   const {
     conversationId = uuidv4(),
@@ -591,73 +623,105 @@ function chat(token, prompt, modelId, options = {}) {
     onThinking = null,     // (text) => void
     signal = null,         // AbortSignal
     bridgeTools = false,   // true 时, write/shell exec 会转换成 tool_calls 暂停会话交还调用方执行
-    firstChunkTimeoutMs = (stream || bridgeTools) ? parseInt(process.env.STREAM_FIRST_CHUNK_TIMEOUT || '60000') : 0,
+    firstChunkTimeoutMs = (stream || bridgeTools) ? computeFirstChunkTimeoutMs(prompt.length) : 0,
     idleTimeoutMs = (stream || bridgeTools) ? parseInt(process.env.STREAM_IDLE_TIMEOUT || '60000') : 0,
   } = options;
 
   return new Promise((resolve, reject) => {
-    let client;
-    try {
-      client = http2.connect(config.cursor.baseUrl);
-    } catch (e) {
-      return reject(new Error(`Connection failed: ${e.message}`));
-    }
-
-    client.on('error', (e) => {
-      // Suppress unhandled errors after cleanup
-    });
-
-    const req = client.request(buildHeaders(token));
-    // 桥接会话生命周期可能跨越多次 HTTP 请求 (等待客户端在本地执行工具), 不能设短超时
-    req.setTimeout(stream || bridgeTools ? 0 : config.cursor.requestTimeout);
-
-    const session = {
-      id: conversationId,
-      client, req,
-      bridgeTools,
-      fullText: '', thinkingText: '', inputTokens: 0, outputTokens: 0, thinkingMs: 0,
-      buffer: Buffer.alloc(0),
-      destroyed: false,
-      settled: false,       // 当前这一段 (chat() 或某次 resumeToolCall()) 是否已经给出结果
-      errorMsg: '',
-      sawTextDelta: false,
-      firstChunkTimer: null,
-      idleTimer: null,
-      heartbeat: null,
-      abandonTimer: null,
-      pendingBridge: null,  // { toolCallId, kind, id, execId, rawArgs }
-      toolCallIndex: toolCallOwner,
-      resolve, reject,
-      onDelta, onThinking,
-      firstChunkTimeoutMs, idleTimeoutMs,
-    };
-    if (bridgeTools) sessions.set(session.id, session);
-
-    wireSession(session);
+    let attempt = 0;
+    let abortedByCaller = false;
 
     if (signal) {
-      if (signal.aborted) return rejectSessionOnce(session, new Error('Request aborted'));
-      signal.addEventListener('abort', () => rejectSessionOnce(session, new Error('Request aborted')), { once: true });
+      if (signal.aborted) return reject(new Error('Request aborted'));
+      signal.addEventListener('abort', () => { abortedByCaller = true; }, { once: true });
     }
 
-    // ━━━ 发送 runRequest ━━━
-    sendFrame(session, {
-      runRequest: {
-        conversationState: {},
-        action: {
-          userMessageAction: {
-            userMessage: { text: prompt },
+    function startAttempt() {
+      attempt++;
+      let client;
+      try {
+        client = http2.connect(config.cursor.baseUrl);
+      } catch (e) {
+        return maybeRetryOrReject(null, e);
+      }
+
+      client.on('error', (e) => {
+        // Suppress unhandled errors after cleanup
+      });
+
+      const req = client.request(buildHeaders(token));
+      // 桥接会话生命周期可能跨越多次 HTTP 请求 (等待客户端在本地执行工具), 不能设短超时
+      req.setTimeout(stream || bridgeTools ? 0 : config.cursor.requestTimeout);
+
+      const session = {
+        id: conversationId,
+        client, req,
+        bridgeTools,
+        fullText: '', thinkingText: '', inputTokens: 0, outputTokens: 0, thinkingMs: 0,
+        buffer: Buffer.alloc(0),
+        destroyed: false,
+        settled: false,       // 当前这一段 (chat() 或某次 resumeToolCall()) 是否已经给出结果
+        errorMsg: '',
+        sawTextDelta: false,
+        firstChunkTimer: null,
+        idleTimer: null,
+        heartbeat: null,
+        abandonTimer: null,
+        pendingBridge: null,  // { toolCallId, kind, id, execId, rawArgs }
+        execQueue: [],        // 暂停等待当前 tool_calls 结果期间, 提前到达的其他 execServerMessage 排队等待
+        toolCallIndex: toolCallOwner,
+        resolve, reject,
+        onDelta, onThinking,
+        firstChunkTimeoutMs, idleTimeoutMs,
+      };
+
+      // 拦下"连接层面的失败" (req 的 error/timeout 事件), 判断是纯网络问题 (还没有任何真实
+      // 进展) 就自动重试, 否则才走正常的 finishSession 失败流程。
+      session.onConnectFailure = (e) => maybeRetryOrReject(session, e);
+
+      if (bridgeTools) sessions.set(session.id, session);
+
+      wireSession(session);
+
+      if (signal) {
+        if (signal.aborted) return rejectSessionOnce(session, new Error('Request aborted'));
+        signal.addEventListener('abort', () => rejectSessionOnce(session, new Error('Request aborted')), { once: true });
+      }
+
+      // ━━━ 发送 runRequest ━━━
+      sendFrame(session, {
+        runRequest: {
+          conversationState: {},
+          action: {
+            userMessageAction: {
+              userMessage: { text: prompt },
+            },
           },
+          modelDetails: {
+            modelId,
+            displayName: modelId,
+            displayNameShort: modelId,
+          },
+          requestedModel: { modelId },
+          conversationId,
         },
-        modelDetails: {
-          modelId,
-          displayName: modelId,
-          displayNameShort: modelId,
-        },
-        requestedModel: { modelId },
-        conversationId,
-      },
-    });
+      });
+    }
+
+    // session 为 null 代表 http2.connect() 本身就同步抛错的情况 (还没有 session 可清理)
+    function maybeRetryOrReject(session, e) {
+      const hasRealProgress = session && (session.sawTextDelta || session.fullText || session.pendingBridge);
+      if (session && !session.destroyed) destroySession(session);
+      if (abortedByCaller) return; // 调用方已经放弃, 不需要再重试或报错
+      if (!hasRealProgress && attempt < 1 + CONNECT_RETRY_COUNT) {
+        console.log(`  ↻ 连接 Cursor 失败 (${e.message}), ${CONNECT_RETRY_DELAY_MS}ms 后重试第 ${attempt + 1}/${1 + CONNECT_RETRY_COUNT} 次`);
+        setTimeout(startAttempt, CONNECT_RETRY_DELAY_MS);
+        return;
+      }
+      reject(new Error(`Connection failed: ${e.message}`));
+    }
+
+    startAttempt();
   });
 }
 
@@ -716,6 +780,11 @@ function rejectSessionOnce(session, error) {
 }
 
 // 暂停当前会话, 把 tool_calls 交还调用方, 但保留底层 http2 流等待 resumeToolCall()
+//
+// ⚠️ clearLegTimers() 这一步很关键: firstChunkTimer/idleTimer 是用来判断"模型本身卡住没反应"的,
+// 一旦进入这个暂停状态就必须清掉, 否则等真人在 IDE 里看确认框、犹豫了一会儿才点确认, 就会被
+// 误判成模型没响应而报错中断整个任务——把"人还没决定"和"后端真的挂了"混为一谈。暂停期间唯一
+// 生效的计时器是下面的 armAbandonGuard, 而它到点了也只是回收内存, 不会报错 (见其注释)。
 function pauseSession(session, { toolCalls }) {
   if (session.settled) return;
   session.settled = true;
@@ -725,6 +794,17 @@ function pauseSession(session, { toolCalls }) {
   session.reject = null;
   armAbandonGuard(session);
   resolveFn({ type: 'tool_calls', toolCalls, sessionId: session.id });
+}
+
+// resumeToolCall() 把当前这个工具调用处理完、session.settled 重新变回 false 之后,
+// 消费掉暂停期间排队的 exec 消息 (可能是又一个 bridge 请求, 会重新把 settled 置 true 并
+// 通过这次 resumeToolCall 的 resolve 把新的 tool_calls 交还客户端; 也可能是无需桥接的
+// headless 类型, 处理完继续消费队列里的下一条)。
+function drainExecQueue(session) {
+  while (!session.settled && !session.destroyed && session.execQueue && session.execQueue.length > 0) {
+    const next = session.execQueue.shift();
+    handleExecMessage(next, (obj) => sendFrame(session, obj), session);
+  }
 }
 
 // 给 handleExecMessage 用: 挂到 session 上, 让它能触发暂停
@@ -787,6 +867,19 @@ function wireSession(session) {
         if (msg.execServerMessage) {
           // 新的 exec 请求本身就是真实进展 (哪怕上一个 shell 兜底还没触发), 避免用旧结果抢跑覆盖新一轮工具调用
           clearShellFallback(session);
+
+          if (session.settled) {
+            // 已经在等待前一个 tool_calls 的结果回传 (pendingBridge 还没被 resumeToolCall 消费),
+            // 这时如果直接调用 handleExecMessage, bridge 分支会就地覆盖 session.pendingBridge/
+            // toolCallOwner, 而 session.pause() 因为 settled=true 会静默 no-op —— 相当于把前一个
+            // 还没交给客户端处理完的工具调用"偷梁换柱"掉, 之后客户端正常回传结果时会找不到对应的
+            // pendingBridge, 报 "No pending tool call found" 直接把整个 agent 对话中断。
+            // 正确做法是把这条 exec 消息排队, 等当前这个工具调用被 resumeToolCall() 处理完之后再消费。
+            (session.execQueue = session.execQueue || []).push(msg.execServerMessage);
+            session.buffer = session.buffer.slice(offset);
+            return;
+          }
+
           handleExecMessage(msg.execServerMessage, (obj) => sendFrame(session, obj), session);
           if (session.settled) {
             // 已暂停等待 tool 结果, 先把已消费的字节从缓冲区移除, 再停止处理剩余帧
@@ -892,8 +985,52 @@ function wireSession(session) {
     else failSession(session, 'Stream ended without content');
   });
   session.req.on('close', () => { if (!session.settled && !session.destroyed && session.sawTextDelta) finishSession(session); });
-  session.req.on('error', (e) => { if (session.destroyed) return; session.errorMsg = e.message; finishSession(session); });
-  session.req.on('timeout', () => { if (session.destroyed) return; session.errorMsg = 'Request timeout'; finishSession(session); });
+  session.req.on('error', (e) => {
+    if (session.destroyed) return;
+    // 还没有任何真实进展的连接层失败 (比如 TLS 握手中途被打断) 交给 chat() 里的重试逻辑处理,
+    // 不当成"这一段对话失败"直接 resolve 出去。
+    if (!session.settled && !session.sawTextDelta && !session.fullText && !session.pendingBridge && session.onConnectFailure) {
+      return session.onConnectFailure(e);
+    }
+    session.errorMsg = e.message;
+    finishSession(session);
+  });
+  session.req.on('timeout', () => {
+    if (session.destroyed) return;
+    if (!session.settled && !session.sawTextDelta && !session.fullText && !session.pendingBridge && session.onConnectFailure) {
+      return session.onConnectFailure(new Error('Request timeout'));
+    }
+    session.errorMsg = 'Request timeout';
+    finishSession(session);
+  });
+}
+
+/**
+ * 查一下某个 toolCallId 对应的 pendingBridge 还在不在、是什么类型 ('write' | 'shell' | 'shellStream')，
+ * 不会消费/修改任何状态。用于调用方 (server.js) 决定要不要真的去 resumeToolCall() 续接原会话——
+ * 已知 shell/shellStream 这条续接路径在 Cursor 后端目前是卡死的 (见 armShellFallback 处的说明),
+ * 所以遇到这两种类型就不该再浪费时间去尝试原会话, 而是直接换一个全新会话。
+ * 返回 null 表示已经找不到了 (会话过期/已被处理)。
+ */
+function peekPendingBridgeKind(toolCallId) {
+  const sessionId = toolCallOwner.get(toolCallId);
+  const session = sessionId ? sessions.get(sessionId) : null;
+  if (!session || session.destroyed || !session.pendingBridge || session.pendingBridge.toolCallId !== toolCallId) {
+    return null;
+  }
+  return session.pendingBridge.kind;
+}
+
+/**
+ * 主动放弃一个还没被 resumeToolCall() 消费的 pendingBridge, 销毁它所在的整条 Cursor 会话。
+ * 用在 "决定不再续接原会话, 改成开一个带完整历史的全新会话" 的场景, 避免旧会话继续占着
+ * http2 连接和 10 分钟的弃用计时器, 白白耗资源等一个注定不会再有人来 resumeToolCall() 的结果。
+ */
+function discardPendingBridge(toolCallId) {
+  const sessionId = toolCallOwner.get(toolCallId);
+  const session = sessionId ? sessions.get(sessionId) : null;
+  toolCallOwner.delete(toolCallId);
+  if (session && !session.destroyed) destroySession(session);
 }
 
 /**
@@ -934,6 +1071,7 @@ function resumeToolCall(toolCallId, outputText, options = {}) {
     }
 
     resetIdleTimer(session);
+    drainExecQueue(session);
   });
 }
 
@@ -1030,4 +1168,4 @@ async function healthCheck(token) {
   }
 }
 
-module.exports = { chat, resumeToolCall, getModels, healthCheck, generateChecksum };
+module.exports = { chat, resumeToolCall, peekPendingBridgeKind, discardPendingBridge, getModels, healthCheck, generateChecksum };

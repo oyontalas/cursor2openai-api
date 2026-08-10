@@ -193,6 +193,8 @@ for chunk in resp:
 | `DEFAULT_MODEL` | `claude-4.5-sonnet` | 默认 Cursor 模型 |
 | `CURSOR_CLIENT_VERSION` | `3.12.17` | Cursor 客户端版本号 (需跟上游保持较新, 太旧会被拒 "Update Required") |
 | `REQUEST_TIMEOUT` | `120000` | 请求超时 (ms) |
+| `CONNECT_RETRY_COUNT` | `2` | 连接 Cursor 后端在拿到任何真实响应前就失败 (纯网络问题), 自动重试的次数 |
+| `CONNECT_RETRY_DELAY_MS` | `600` | 上面每次重试之间的等待时间 (ms) |
 
 以下变量只影响 **Agent 工具调用**（Copilot 这类会声明 `tools` 的客户端），普通聊天完全不受影响：
 
@@ -206,6 +208,17 @@ for chunk in resp:
 | `SHELL_TIMEOUT_MS` | `120000` | `ENABLE_SHELL=1` 时单条命令的最长执行时间 (ms) |
 | `SHELL_MAX_OUTPUT_BYTES` | `200000` | `ENABLE_SHELL=1` 时单条命令输出的最大字节数 |
 | `SHELL_FALLBACK_GRACE_MS` | `15000` | shell 命令真实执行完毕后的收尾宽限期，见下文说明 |
+| `STREAM_FIRST_CHUNK_TIMEOUT` | `90000` | 等待首个响应字符的基础超时 (ms)，会按 prompt 长度自适应变长 |
+| `STREAM_FIRST_CHUNK_TIMEOUT_MAX` | `300000` | 首字超时自适应拉长后的绝对上限 (ms) |
+| `STREAM_FIRST_CHUNK_MS_PER_CHAR` | `2` | prompt 每多 1 字符，首字超时增加多少 ms |
+| `STREAM_IDLE_TIMEOUT` | `60000` | 流式响应中两帧之间的最长静默时间 (ms) |
+| `BRIDGE_SESSION_TIMEOUT` | `1800000` | 等待真人在 IDE 里确认执行 (如 shell 确认框) 的最长时间 (ms)，到点不报错，只回收内存 |
+
+> **关于上下文长度/死循环**：本服务定位是纯中转/桥接，重建历史 prompt 时不做长度裁剪、也不做重复调用检测——上下文窗口大小、任务是否陷入死循环等应由调用方 (agent/客户端) 自行控制和判断；如果重建出来的 prompt 确实超出了模型的上下文上限，会由 Cursor 后端自然报错，本服务只是原样把这个错误透传给调用方，不会尝试静默截断或注入额外的提示文字去"纠正"模型的行为。
+
+> **超时设计原则**：只有真正判断"模型/网络卡住没反应"时才应该超时；等真人确认 (比如 shell 的允许执行确认框) 属于合理的、可能很长的等待，不该被当成超时处理掉。因此 `pauseSession` 交还 `tool_calls` 给客户端后，会显式清掉 `STREAM_FIRST_CHUNK_TIMEOUT`/`STREAM_IDLE_TIMEOUT` 这两个计时器；等待期间唯一还在跑的 `BRIDGE_SESSION_TIMEOUT` 到点了也只是清内存，不会让任务报错——真人晚一点确认，服务端会自动改用"开新会话续接完整历史"接着处理，不会中断。真正的网络层失败（比如 TLS 握手中途被打断）会走 `CONNECT_RETRY_COUNT` 自动重试。
+>
+> **为什么首字超时会随 prompt 长度自适应拉长**：shell/shellStream 续接不上原会话时，会带着完整对话历史开新会话重试；任务步骤越多，这段历史就越长，Cursor 后端处理耗时也越长。曾在一次长任务里观察到 prompt 从 28K 字符涨到 46K 字符、最终触发固定 60 秒的首字超时把整段对话中断，因此改成随 prompt 长度自适应拉长超时上限（见 `STREAM_FIRST_CHUNK_MS_PER_CHAR`），而不是去限制 prompt 本身的长度。
 
 ## 🧰 Agent 工具支持 (VSCode Copilot 专用)
 
@@ -225,13 +238,13 @@ VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里�
 
 | 工具 | 开关 | 说明 |
 |------|------|------|
-| 读文件 / 列目录 / grep / glob | 默认开启 | 只读，限定在 `WORKSPACE_ROOT` 内 |
+| 读文件 / 列目录 / grep / glob | 默认开启 | 只读，限定在 `WORKSPACE_ROOT` 内；单文件最多读 `CURSOR_TOOL_MAX_READ_BYTES` 字节 (默认 120000)，列目录/搜索最多返回 `CURSOR_TOOL_MAX_LIST_ENTRIES` 条 (默认 200) |
 | 写文件 / 删除文件 | `ENABLE_WRITE=1` | 直接操作服务器磁盘上的 `WORKSPACE_ROOT` |
 | Shell 命令 | `ENABLE_SHELL=1` | 用 `child_process.spawn` 在服务器本机真实执行，不弹确认框 |
 
 > ⚠️ `ENABLE_WRITE=1` / `ENABLE_SHELL=1` 会让模型真实改写文件、真实执行命令。如果代理和你的 VSCode/Cursor 在同一台机器上，这等价于让模型拥有你本机的 shell 权限，请只在信任的本地/内网环境开启。同时开启 `BRIDGE_TOOLS`+`BRIDGE_SHELL` 时会优先走桥接（体验更好，有确认框）；只有调用方没声明 `tools` 时才会退回这里。
 
-原理：OpenAI 的 `/v1/chat/completions` 本身无状态，每次都要带上完整 `messages`。代理暂停等待客户端执行工具时，底层与 Cursor 的连接不会关闭，会保持在内存中等待客户端把 `role: "tool"` 结果通过下一次请求传回来，再恢复连接继续对话。超过 10 分钟 (`BRIDGE_SESSION_TIMEOUT`) 没有回传则自动回收。
+原理：OpenAI 的 `/v1/chat/completions` 本身无状态，每次都要带上完整 `messages`。代理暂停等待客户端执行工具时，底层与 Cursor 的连接不会关闭，会保持在内存中等待客户端把 `role: "tool"` 结果通过下一次请求传回来，再恢复连接继续对话。超过 `BRIDGE_SESSION_TIMEOUT`（默认 30 分钟）没有回传则自动回收内存（不影响任务，回传时会自动改用开新会话续接）。
 
 ## 🗺️ 模型映射
 
