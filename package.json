@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
-    "dev": "node --env-file-if-exists=.env server.js"
+    "dev": "node --env-file-if-exists=.env server.js",
+    "sync-token": "node scripts/sync-token.js"
   },
   "keywords": ["cursor", "openai", "api", "proxy"],
   "author": "",

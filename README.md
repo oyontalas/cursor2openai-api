@@ -22,6 +22,8 @@ cursor2openai-api/
 │   ├── config.js          # 配置 & 模型映射
 │   ├── converter.js       # OpenAI ↔ Cursor 格式转换
 │   └── cursor-client.js   # Cursor Agent API 客户端 (H2 + ConnectRPC)
+├── scripts/
+│   └── sync-token.js      # 从本机 Cursor 客户端提取凭证, 自动写入 token.json
 ├── token.json.example     # Token 配置模板
 ├── .env.example           # 环境变量模板
 ├── package.json
@@ -60,8 +62,25 @@ cp token.json.example token.json
 }
 ```
 
+> 💡 换设备 / 换账号时，不用每次都手动翻 SQLite，直接跑：
+>
+> ```bash
+> npm run sync-token
+> ```
+>
+> 会自动从本机 Cursor 客户端的本地数据库里提取当前登录账号的凭证，更新/新增到 `token.json`（旧内容自动备份为 `token.json.bak`）。常用参数：
+>
+> | 参数 | 作用 |
+> |------|------|
+> | `--dry-run` | 只打印提取结果，不实际写文件 |
+> | `--add` | 强制新增一条记录 (多账号轮询场景)，默认是"更新匹配到的那条/唯一那条" |
+> | `--name <label>` | 指定这条记录的 `name` 字段 (默认用账号邮箱) |
+> | `--db <path>` | 手动指定 `state.vscdb` 路径 (比如从别的设备拷过来的库文件) |
+>
+> 服务正在运行时会自动热加载，不需要重启。
+
 <details>
-<summary>📖 如何获取凭证？</summary>
+<summary>📖 不想用脚本？也可以手动获取凭证</summary>
 
 Cursor 凭证存储在本地 SQLite 数据库中：
 
