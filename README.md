@@ -1,14 +1,14 @@
 # CursorIDE2API
 
-> 🔄 将 Cursor IDE 的 Agent API 转换成 OpenAI 兼容接口的轻量中转服务。任何 OpenAI SDK / 客户端都能直接对接；同时针对 **VSCode Copilot Chat 的 Agent 模式**做了专门的工具调用桥接，让 Copilot 能像连普通模型一样连上 Cursor 的模型。
+> 🔄 将 Cursor IDE 的 Agent API 转换成 OpenAI 兼容接口的轻量中转服务。支持通过 OpenAI SDK / 兼容客户端调用；同时针对 **VSCode Copilot Chat 的 Agent 模式**做了专门的工具调用桥接，让 Copilot 能像连普通模型一样连上 Cursor 的模型。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## ✨ 特性
 
-- 🔌 **OpenAI 兼容** — `/v1/chat/completions` + `/v1/models`，可直接对接任何 OpenAI SDK / 兼容客户端
+- 🔌 **OpenAI 兼容** — `/v1/chat/completions` + `/v1/models`，支持文本对话和工具调用桥接
 - 🌊 **流式 & 非流式** — 完整支持 SSE 流式响应
-- 📦 **零依赖数据库** — 只需一个 `token.json`，无需 SQLite / Redis
+- 📦 **无需独立数据库服务** — 运行代理只需 `token.json`；凭据同步脚本读取本机 Cursor 的 SQLite 数据库
 - 🔑 **多 Token 轮询** — 支持多账号 round-robin 负载均衡，改 `token.json` 自动热更新
 - 🛡️ **可选鉴权** — 环境变量设置 `API_KEY` 即可启用
 - 🧩 **VSCode Copilot Agent 桥接** (可选) — 把 Cursor Agent 内部的"写文件"/"跑命令"请求转换成标准 OpenAI `tool_calls`，交还 Copilot 在真实项目目录里执行，详见下文
@@ -32,6 +32,8 @@ cursor2openai-api/
 ```
 
 ## 🚀 快速开始
+
+建议使用 Node.js 24 或更新版本。启动脚本使用 Node 内置的 [`--env-file-if-exists`](https://nodejs.org/api/cli.html#--env-file-if-existsfile)；同步凭据时需先在本机 Cursor 客户端登录。
 
 ### 1. 克隆 & 安装
 
@@ -72,10 +74,12 @@ cp token.json.example token.json
 >
 > | 参数 | 作用 |
 > |------|------|
-> | `--dry-run` | 只打印提取结果，不实际写文件 |
+> | `--dry-run` | 预览完整凭据，不写文件；输出含 Token，请勿分享 |
 > | `--add` | 强制新增一条记录 (多账号轮询场景)，默认是"更新匹配到的那条/唯一那条" |
 > | `--name <label>` | 指定这条记录的 `name` 字段 (默认用账号邮箱) |
 > | `--db <path>` | 手动指定 `state.vscdb` 路径 (比如从别的设备拷过来的库文件) |
+>
+> 通过 npm 传参时加 `--`，例如 `npm run sync-token -- --add --name account-2`。自定义输出路径可使用 `--file <path>`，并让服务端的 `TOKEN_FILE` 指向同一文件。
 >
 > 服务正在运行时会自动热加载，不需要重启。
 
@@ -124,27 +128,24 @@ API_KEY=你自己的密钥
 npm start
 ```
 
-```
-  ╔═══════════════════════════════════════════╗
-  ║       CursorIDE2API v2.0 (Lite)           ║
-  ╠═══════════════════════════════════════════╣
-  ║  🌐 http://0.0.0.0:3000                   ║
-  ║  🔌 /v1/chat/completions                  ║
-  ║  📋 /v1/models                            ║
-  ╠═══════════════════════════════════════════╣
-  ║  🔑 Tokens: 1                              ║
-  ║  🤖 Default: claude-4.5-sonnet             ║
-  ║  🔐 API Key: OPEN (no key)                 ║
-  ╚═══════════════════════════════════════════╝
-```
+启动后，API 地址为 `http://localhost:3000/v1`。`GET /health` 可检查进程状态，但不会验证上游凭据是否有效。
 
 ## 📡 API 使用
+
+当前转换器只处理文本内容，暂不转发图片、音频以及 `temperature`、`max_tokens` 等生成参数。
+
+以下示例假设已启用鉴权。先在调用端终端设置 `API_KEY`，值与服务端 `.env` 一致；Python 示例也读取这一环境变量。
+
+```bash
+export API_KEY="你在服务端配置的密钥"
+```
 
 ### Chat Completions
 
 ```bash
 # 非流式
 curl http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4",
@@ -153,6 +154,7 @@ curl http://localhost:3000/v1/chat/completions \
 
 # 流式
 curl http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4",
@@ -164,26 +166,19 @@ curl http://localhost:3000/v1/chat/completions \
 ### 模型列表
 
 ```bash
-curl http://localhost:3000/v1/models
-```
-
-### 带 API Key
-
-```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}'
+curl http://localhost:3000/v1/models \
+  -H "Authorization: Bearer $API_KEY"
 ```
 
 ### Python (OpenAI SDK)
 
 ```python
+import os
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:3000/v1",
-    api_key="any-string"  # 未设置 API_KEY 时填任意值
+    api_key=os.environ["API_KEY"]
 )
 
 resp = client.chat.completions.create(
@@ -193,7 +188,7 @@ resp = client.chat.completions.create(
 )
 
 for chunk in resp:
-    if chunk.choices[0].delta.content:
+    if chunk.choices and chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="")
 ```
 
@@ -211,37 +206,35 @@ for chunk in resp:
 | `TOKEN_FILE` | `./token.json` | Token 文件路径 |
 | `DEFAULT_MODEL` | `claude-4.5-sonnet` | 默认 Cursor 模型 |
 | `CURSOR_CLIENT_VERSION` | `3.12.17` | Cursor 客户端版本号 (需跟上游保持较新, 太旧会被拒 "Update Required") |
-| `REQUEST_TIMEOUT` | `120000` | 请求超时 (ms) |
+| `REQUEST_TIMEOUT` | `120000` | 非流式、未启用桥接时的请求空闲超时 (ms) |
 | `CONNECT_RETRY_COUNT` | `2` | 连接 Cursor 后端在拿到任何真实响应前就失败 (纯网络问题), 自动重试的次数 |
 | `CONNECT_RETRY_DELAY_MS` | `600` | 上面每次重试之间的等待时间 (ms) |
 
-以下变量只影响 **Agent 工具调用**（Copilot 这类会声明 `tools` 的客户端），普通聊天完全不受影响：
+以下为工具执行、桥接和流式响应配置。`STREAM_*` 同时影响普通流式聊天；服务端工具开关也适用于未声明 `tools` 的请求：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `BRIDGE_TOOLS` | _(空=关闭)_ | 设为 `1` 开启 tool_calls 桥接 (推荐, 见下文) |
 | `BRIDGE_SHELL` | _(空=关闭)_ | 配合 `BRIDGE_TOOLS=1`, 让客户端弹出确认框后在本地终端真实执行 shell 命令 |
 | `WORKSPACE_ROOT` | _(进程 cwd)_ | 服务端直接处理模式下, read/ls/grep/write 的工作目录 |
+| `CURSOR_TOOL_MAX_READ_BYTES` | `120000` | 服务端读文件工具返回的最大字节数 |
+| `CURSOR_TOOL_MAX_LIST_ENTRIES` | `200` | 服务端目录和搜索工具的条目上限 |
 | `ENABLE_WRITE` | _(空=关闭)_ | 设为 `1` 允许 Agent 直接在服务器上写入/删除 `WORKSPACE_ROOT` 内的文件 |
 | `ENABLE_SHELL` | _(空=关闭)_ | 设为 `1` 允许 Agent 直接在服务器本机真实执行 shell 命令, 不弹确认框 |
 | `SHELL_TIMEOUT_MS` | `120000` | `ENABLE_SHELL=1` 时单条命令的最长执行时间 (ms) |
 | `SHELL_MAX_OUTPUT_BYTES` | `200000` | `ENABLE_SHELL=1` 时单条命令输出的最大字节数 |
-| `SHELL_FALLBACK_GRACE_MS` | `15000` | shell 命令真实执行完毕后的收尾宽限期，见下文说明 |
+| `SHELL_FALLBACK_GRACE_MS` | `15000` | 服务端 shell 执行结束后，上游不再推进时的收尾宽限期 (ms) |
 | `STREAM_FIRST_CHUNK_TIMEOUT` | `90000` | 等待首个响应字符的基础超时 (ms)，会按 prompt 长度自适应变长 |
 | `STREAM_FIRST_CHUNK_TIMEOUT_MAX` | `300000` | 首字超时自适应拉长后的绝对上限 (ms) |
 | `STREAM_FIRST_CHUNK_MS_PER_CHAR` | `2` | prompt 每多 1 字符，首字超时增加多少 ms |
 | `STREAM_IDLE_TIMEOUT` | `60000` | 流式响应中两帧之间的最长静默时间 (ms) |
 | `BRIDGE_SESSION_TIMEOUT` | `1800000` | 等待真人在 IDE 里确认执行 (如 shell 确认框) 的最长时间 (ms)，到点不报错，只回收内存 |
 
-> **关于上下文长度/死循环**：本服务定位是纯中转/桥接，重建历史 prompt 时不做长度裁剪、也不做重复调用检测——上下文窗口大小、任务是否陷入死循环等应由调用方 (agent/客户端) 自行控制和判断；如果重建出来的 prompt 确实超出了模型的上下文上限，会由 Cursor 后端自然报错，本服务只是原样把这个错误透传给调用方，不会尝试静默截断或注入额外的提示文字去"纠正"模型的行为。
-
-> **超时设计原则**：只有真正判断"模型/网络卡住没反应"时才应该超时；等真人确认 (比如 shell 的允许执行确认框) 属于合理的、可能很长的等待，不该被当成超时处理掉。因此 `pauseSession` 交还 `tool_calls` 给客户端后，会显式清掉 `STREAM_FIRST_CHUNK_TIMEOUT`/`STREAM_IDLE_TIMEOUT` 这两个计时器；等待期间唯一还在跑的 `BRIDGE_SESSION_TIMEOUT` 到点了也只是清内存，不会让任务报错——真人晚一点确认，服务端会自动改用"开新会话续接完整历史"接着处理，不会中断。真正的网络层失败（比如 TLS 握手中途被打断）会走 `CONNECT_RETRY_COUNT` 自动重试。
->
-> **为什么首字超时会随 prompt 长度自适应拉长**：shell/shellStream 续接不上原会话时，会带着完整对话历史开新会话重试；任务步骤越多，这段历史就越长，Cursor 后端处理耗时也越长。曾在一次长任务里观察到 prompt 从 28K 字符涨到 46K 字符、最终触发固定 60 秒的首字超时把整段对话中断，因此改成随 prompt 长度自适应拉长超时上限（见 `STREAM_FIRST_CHUNK_MS_PER_CHAR`），而不是去限制 prompt 本身的长度。
+上下文会完整转换为 prompt，不做裁剪或重复调用检测；调用方需管理上下文长度。首字超时随 prompt 长度增长，并受 `STREAM_FIRST_CHUNK_TIMEOUT_MAX` 限制。等待客户端执行工具期间暂停首字和空闲计时，`BRIDGE_SESSION_TIMEOUT` 仅用于回收挂起会话；结果回传时若会话已过期，会带完整历史新建会话。
 
 ## 🧰 Agent 工具支持 (VSCode Copilot 专用)
 
-VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里会声明它自己支持的工具（`create_file`、`run_in_terminal` 等），并期望模型返回 `tool_calls` 让**它自己**在本地执行，而不是服务器代为执行。不带 `tools` 字段的普通请求完全不受这套逻辑影响。
+VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里会声明它自己支持的工具（`create_file`、`run_in_terminal` 等），并期望模型返回 `tool_calls` 让**它自己**在本地执行，而不是服务器代为执行。桥接需要请求携带 `tools`；未启用桥接时，上游工具请求按服务端工具配置处理。目前桥接针对 `create_file` 和 `run_in_terminal`，不提供任意自定义函数的通用映射。
 
 ### 推荐方式：tool_calls 桥接 (`BRIDGE_TOOLS=1`)
 
@@ -249,7 +242,7 @@ VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里�
 
 再加上 `BRIDGE_SHELL=1`，"跑终端命令"也会走同样的桥接：Copilot 会弹出它原生的"允许执行此命令？"确认框，用户确认后命令在**客户端自己的终端**里真实执行。
 
-> **已知限制**：Cursor 后端在收到桥接结果（无论是写文件还是 shell 结果）后，通常不会像处理原生工具那样干净地结束这次工具调用（只会发心跳，不推进对话）。因为客户端那边其实已经真实完成了操作并拿到了正确结果，代理会在收到结果后等待 `SHELL_FALLBACK_GRACE_MS`（默认 15 秒，写文件桥接则更快）——如果这段时间内会话仍未推进，就直接用已经拿到的真实结果收尾返回。代价是可能拿不到模型对结果的二次总结（返回的是原始执行结果），但功能上可用，读写和 shell 都已端到端验证。
+> **续接方式**：写文件结果优先回传原 Cursor 会话；shell 结果会带完整对话历史新建会话，以避开上游 shell 续接停滞。会话过期或写文件续接失败时，也会尝试新建会话。客户端需在后续请求中保留 `assistant.tool_calls` 和对应的 `role: "tool"` 结果。
 
 ### 备用方式：服务端直接处理
 
@@ -263,11 +256,11 @@ VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里�
 
 > ⚠️ `ENABLE_WRITE=1` / `ENABLE_SHELL=1` 会让模型真实改写文件、真实执行命令。如果代理和你的 VSCode/Cursor 在同一台机器上，这等价于让模型拥有你本机的 shell 权限，请只在信任的本地/内网环境开启。同时开启 `BRIDGE_TOOLS`+`BRIDGE_SHELL` 时会优先走桥接（体验更好，有确认框）；只有调用方没声明 `tools` 时才会退回这里。
 
-原理：OpenAI 的 `/v1/chat/completions` 本身无状态，每次都要带上完整 `messages`。代理暂停等待客户端执行工具时，底层与 Cursor 的连接不会关闭，会保持在内存中等待客户端把 `role: "tool"` 结果通过下一次请求传回来，再恢复连接继续对话。超过 `BRIDGE_SESSION_TIMEOUT`（默认 30 分钟）没有回传则自动回收内存（不影响任务，回传时会自动改用开新会话续接）。
+服务端直接执行 shell 后，若上游在 `SHELL_FALLBACK_GRACE_MS` 内没有继续推进，会以已捕获的命令输出结束响应，此时可能没有模型对结果的进一步总结。`WORKSPACE_ROOT` 是路径范围配置，不是操作系统级沙箱；只应在可信环境中运行。
 
 ## 🗺️ 模型映射
 
-传入 OpenAI 风格模型名会自动映射到 Cursor 原生模型：
+传入下列模型别名会映射到配置中的 Cursor 模型；这些名称不代表调用了同名的 OpenAI 模型。可用性以当前账号的 `/v1/models` 返回为准。不传 `model` 时使用 `DEFAULT_MODEL`。
 
 | 传入 | 映射到 |
 |------|--------|
@@ -280,7 +273,7 @@ VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里�
 
 > 💡 也可直接传 Cursor 原生模型名 (如 `composer-2.5`、`claude-4.5-sonnet-thinking`)，会直接透传。
 >
-> 📌 响应里的 `model` 字段返回的是**实际回答的 Cursor 模型**（映射后的目标，如 `composer-2.5`），而不是原样回显你传入的别名（如 `gpt-4`），避免造成"以为是某个模型在回答，实际是另一个"的误导。想知道某个别名具体会打到哪个模型，可查上表，或直接看服务端终端日志（会打印 `别名 → 实际模型`）。
+> 📌 响应里的 `model` 字段返回的是**请求使用的 Cursor 模型 ID**（映射后的目标，如 `composer-2.5`），而不是原样回显你传入的别名（如 `gpt-4`），避免造成"以为是某个模型在回答，实际是另一个"的误导。想知道某个别名具体会打到哪个模型，可查上表，或直接看服务端终端日志（会打印 `别名 → 实际模型`）。
 
 ## 🏗️ 技术原理
 

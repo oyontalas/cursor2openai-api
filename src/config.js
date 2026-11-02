@@ -25,13 +25,10 @@ const config = {
     'claude-3-sonnet': 'claude-4.6-sonnet-medium',
     'claude-3.5-sonnet': 'claude-4.5-sonnet',
     'gemini-pro': 'gemini-3.1-pro',
-    // 直通 (composer-2 / composer-2-fast / composer-1.5 已停用, 重定向到 2.5)
+    // 旧模型别名兼容
     'composer-2': 'composer-2.5',
     'composer-2-fast': 'composer-2.5-fast',
     'composer-1.5': 'composer-2.5-fast',
-    'composer-2.5': 'composer-2.5',
-    'composer-2.5-fast': 'composer-2.5-fast',
-    'default': 'default',
   },
 };
 

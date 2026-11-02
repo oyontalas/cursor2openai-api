@@ -6,12 +6,12 @@
  *
  * 用法：
  *   node scripts/sync-token.js                   # 提取当前登录账号, 更新/新增到 token.json
- *   npm run sync-token                            # 等价于上面 (见 package.json)
+ *   npm run sync-token                           # 等价于上面 (见 package.json)
  *   node scripts/sync-token.js --add              # 强制新增一条记录 (用于多账号轮询, 而不是覆盖已有的)
  *   node scripts/sync-token.js --name my-account   # 指定这条记录的 name 字段
  *   node scripts/sync-token.js --db /path/to/state.vscdb   # 手动指定数据库路径 (比如从别的设备拷过来的库文件)
  *   node scripts/sync-token.js --file ./other.json # 写入别的 token 文件 (默认项目根目录下的 token.json)
- *   node scripts/sync-token.js --dry-run           # 只打印提取结果和将要写入的内容, 不实际写文件
+ *   node scripts/sync-token.js --dry-run          # 打印完整凭据预览, 不写文件; 勿分享输出
  *
  * 原理：Cursor 客户端把登录凭证存在本地 SQLite (state.vscdb) 的 ItemTable 表里:
  *   - cursorAuth/accessToken   认证令牌 (必须)

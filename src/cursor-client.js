@@ -82,11 +82,7 @@ const ENABLE_SHELL = /^(1|true|yes|on)$/i.test(process.env.ENABLE_SHELL || '');
 const SHELL_TIMEOUT_MS = parseInt(process.env.SHELL_TIMEOUT_MS || '120000');
 const SHELL_MAX_OUTPUT_BYTES = parseInt(process.env.SHELL_MAX_OUTPUT_BYTES || '200000');
 
-// 首字超时: 实测 "放弃卡死会话, 带完整历史开新会话续接" 场景下, prompt 会随着工具调用轮数
-// 越滚越大 (曾在一次 arxiv-paper-qa 任务里从 28K 字符涨到 46K 字符), Cursor 后端处理这么长的
-// prompt、给出第一个响应字符所需时间也随之变长, 固定 60s 首字超时在长 prompt 下会被真实触发
-// (报错 "First stream chunk timeout"), 把整段 agent 对话强行截断。这里改成随 prompt 长度自适应
-// 拉长超时上限 (同时设置绝对上限, 避免调用方一直挂着白等)。
+// 新会话续接时会携带完整历史，首字超时按 prompt 长度增长，并设绝对上限。
 const STREAM_FIRST_CHUNK_BASE_MS = parseInt(process.env.STREAM_FIRST_CHUNK_TIMEOUT || '90000');
 const STREAM_FIRST_CHUNK_MAX_MS = parseInt(process.env.STREAM_FIRST_CHUNK_TIMEOUT_MAX || '300000');
 const STREAM_FIRST_CHUNK_MS_PER_CHAR = parseFloat(process.env.STREAM_FIRST_CHUNK_MS_PER_CHAR || '2');
@@ -453,8 +449,7 @@ function handleExecMessage(exec, writeFrame, session = null) {
     const a = exec.shellStreamArgs || {};
     const cwd = a.workingDirectory || a.args?.workingDirectory || WORKSPACE_ROOT;
     // 优先走桥接 (BRIDGE_SHELL): 能让 VSCode/Copilot 弹出原生的"允许执行此命令?"确认框,
-    // 命令也在客户端自己的终端里真实执行, 体验上更贴近原生 Agent。命令结果拿到后仍会用
-    // armShellFallback 兜底收尾 (Cursor 后端目前不认可我们的 exit 回复, 见 README)。
+    // 命令在客户端执行；server.js 收到 shell 结果后会带完整历史新建会话。
     if (session && session.bridgeTools && BRIDGE_SHELL) {
       const toolCallId = toToolCallId();
       const toolCall = buildBridgeToolCall('shellStream', a);
@@ -779,12 +774,7 @@ function rejectSessionOnce(session, error) {
   session.reject(error);
 }
 
-// 暂停当前会话, 把 tool_calls 交还调用方, 但保留底层 http2 流等待 resumeToolCall()
-//
-// ⚠️ clearLegTimers() 这一步很关键: firstChunkTimer/idleTimer 是用来判断"模型本身卡住没反应"的,
-// 一旦进入这个暂停状态就必须清掉, 否则等真人在 IDE 里看确认框、犹豫了一会儿才点确认, 就会被
-// 误判成模型没响应而报错中断整个任务——把"人还没决定"和"后端真的挂了"混为一谈。暂停期间唯一
-// 生效的计时器是下面的 armAbandonGuard, 而它到点了也只是回收内存, 不会报错 (见其注释)。
+// 交还 tool_calls 后保留连接，并暂停响应计时；等待客户端执行期间只保留会话回收计时。
 function pauseSession(session, { toolCalls }) {
   if (session.settled) return;
   session.settled = true;
@@ -1024,7 +1014,7 @@ function peekPendingBridgeKind(toolCallId) {
 /**
  * 主动放弃一个还没被 resumeToolCall() 消费的 pendingBridge, 销毁它所在的整条 Cursor 会话。
  * 用在 "决定不再续接原会话, 改成开一个带完整历史的全新会话" 的场景, 避免旧会话继续占着
- * http2 连接和 10 分钟的弃用计时器, 白白耗资源等一个注定不会再有人来 resumeToolCall() 的结果。
+ * http2 连接和会话回收计时器, 白白耗资源等一个注定不会再有人来 resumeToolCall() 的结果。
  */
 function discardPendingBridge(toolCallId) {
   const sessionId = toolCallOwner.get(toolCallId);

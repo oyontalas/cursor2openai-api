@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const cursorClient = require('./src/cursor-client');
 const converter = require('./src/converter');
+const config = require('./src/config');
 
 // stdout/stderr 没有连接真正的 TTY 时 (比如被重定向到文件, 或跑在 nohup/后台管理工具里),
 // Node 默认会做全缓冲, 导致 console.log 攒很久才真正落地 (甚至要等进程退出才 flush)。
@@ -24,8 +25,7 @@ const PORT = parseInt(process.env.PORT || '3000');
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.API_KEY || '';  // 留空 = 不校验
 const TOKEN_FILE = process.env.TOKEN_FILE || path.join(__dirname, 'token.json');
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'claude-4.5-sonnet';
-const CLIENT_VERSION = process.env.CURSOR_CLIENT_VERSION || '3.12.17';
+const DEFAULT_MODEL = config.cursor.defaultModel;
 
 // tool_calls 桥接: 客户端 (如 VSCode Copilot) 声明了 tools 时,
 // 把 Cursor 内部的 write/shell 请求转换成 OpenAI tool_calls 交还客户端本地执行。
@@ -146,7 +146,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     return res.status(503).json(converter.buildErrorResponse('No available tokens', 'server_error', 503));
   }
 
-  const requestedModel = model || 'gpt-4';
+  const requestedModel = model || DEFAULT_MODEL;
   const cursorModel = converter.mapModel(requestedModel);
   const isStream = stream === true;
 
