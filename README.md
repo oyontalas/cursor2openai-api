@@ -1,17 +1,16 @@
 # CursorIDE2API
 
-> 🔄 将 Cursor IDE 的 Agent API 转换成 OpenAI 兼容接口的轻量中转服务。支持通过 OpenAI SDK / 兼容客户端调用；同时针对 **VSCode Copilot Chat 的 Agent 模式**做了专门的工具调用桥接，让 Copilot 能像连普通模型一样连上 Cursor 的模型。
+> 将 Cursor 的文本聊天接口转换为 OpenAI 兼容的 `/v1/chat/completions` 和 `/v1/models`，支持流式与非流式响应。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## ✨ 特性
 
-- 🔌 **OpenAI 兼容** — `/v1/chat/completions` + `/v1/models`，支持文本对话和工具调用桥接
+- 🔌 **OpenAI 兼容** — `/v1/chat/completions` + `/v1/models`，支持文本对话
 - 🌊 **流式 & 非流式** — 完整支持 SSE 流式响应
 - 📦 **无需独立数据库服务** — 运行代理只需 `token.json`；凭据同步脚本读取本机 Cursor 的 SQLite 数据库
 - 🔑 **多 Token 轮询** — 支持多账号 round-robin 负载均衡，改 `token.json` 自动热更新
 - 🛡️ **可选鉴权** — 环境变量设置 `API_KEY` 即可启用
-- 🧩 **VSCode Copilot Agent 桥接** (可选) — 把 Cursor Agent 内部的"写文件"/"跑命令"请求转换成标准 OpenAI `tool_calls`，交还 Copilot 在真实项目目录里执行，详见下文
 
 ## 📁 项目结构
 
@@ -24,6 +23,8 @@ cursor2openai-api/
 │   └── cursor-client.js   # Cursor Agent API 客户端 (H2 + ConnectRPC)
 ├── scripts/
 │   └── sync-token.js      # 从本机 Cursor 客户端提取凭证, 自动写入 token.json
+├── test/
+│   └── chat.test.js       # 文本聊天、协议处理和工具拒绝的回归测试
 ├── token.json.example     # Token 配置模板
 ├── .env.example           # 环境变量模板
 ├── package.json
@@ -120,8 +121,6 @@ API_KEY=你自己的密钥
 
 `npm start` 会自动读取 `.env`（基于 Node 内置的 `--env-file-if-exists`，无需额外依赖）。
 
-如果你只需要普通的 OpenAI 兼容聊天接口，到这一步就配置完了，可以直接跳到「启动」。如果你想接入 **VSCode Copilot Chat 的 Agent 模式**（让它能创建文件、跑终端命令），再看一眼下面的「Agent 工具支持」章节，按需开启 `BRIDGE_TOOLS` / `BRIDGE_SHELL`。
-
 ### 4. 启动
 
 ```bash
@@ -132,7 +131,7 @@ npm start
 
 ## 📡 API 使用
 
-当前转换器只处理文本内容，暂不转发图片、音频以及 `temperature`、`max_tokens` 等生成参数。
+当前支持文本消息（`system`、`developer`、`user`、`assistant`）。工具调用及工具结果消息返回 HTTP 400；代理不会读写工作区文件或执行命令。图片、音频以及 `temperature`、`max_tokens` 等生成参数暂不支持。
 
 以下示例假设已启用鉴权。先在调用端终端设置 `API_KEY`，值与服务端 `.env` 一致；Python 示例也读取这一环境变量。
 
@@ -192,10 +191,6 @@ for chunk in resp:
         print(chunk.choices[0].delta.content, end="")
 ```
 
-### VSCode Copilot Chat
-
-在 VSCode 里把 Copilot Chat 的模型指向本服务的 `/v1` 地址（比如通过支持自定义 OpenAI 端点的模型提供方设置），`API_KEY` 填你在 `.env` 里设置的那个。普通对话开箱即用；要让 Copilot 的 Agent 模式（创建文件、跑终端命令）也能工作，见下一节。
-
 ## ⚙️ 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -206,57 +201,20 @@ for chunk in resp:
 | `TOKEN_FILE` | `./token.json` | Token 文件路径 |
 | `DEFAULT_MODEL` | `claude-4.5-sonnet` | 默认 Cursor 模型 |
 | `CURSOR_CLIENT_VERSION` | `3.12.17` | Cursor 客户端版本号 (需跟上游保持较新, 太旧会被拒 "Update Required") |
-| `REQUEST_TIMEOUT` | `120000` | 非流式、未启用桥接时的请求空闲超时 (ms) |
+| `REQUEST_TIMEOUT` | `120000` | 非流式请求空闲超时 (ms) |
 | `CONNECT_RETRY_COUNT` | `2` | 连接 Cursor 后端在拿到任何真实响应前就失败 (纯网络问题), 自动重试的次数 |
 | `CONNECT_RETRY_DELAY_MS` | `600` | 上面每次重试之间的等待时间 (ms) |
 
-以下为工具执行、桥接和流式响应配置。`STREAM_*` 同时影响普通流式聊天；服务端工具开关也适用于未声明 `tools` 的请求：
+流式响应使用以下超时配置：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `BRIDGE_TOOLS` | _(空=关闭)_ | 设为 `1` 开启 tool_calls 桥接 (推荐, 见下文) |
-| `BRIDGE_SHELL` | _(空=关闭)_ | 配合 `BRIDGE_TOOLS=1`, 让客户端弹出确认框后在本地终端真实执行 shell 命令 |
-| `WORKSPACE_ROOT` | _(进程 cwd)_ | 服务端直接处理模式下, read/ls/grep/write 的工作目录 |
-| `CURSOR_TOOL_MAX_READ_BYTES` | `120000` | 服务端读文件工具返回的最大字节数 |
-| `CURSOR_TOOL_MAX_LIST_ENTRIES` | `200` | 服务端目录和搜索工具的条目上限 |
-| `ENABLE_WRITE` | _(空=关闭)_ | 设为 `1` 允许 Agent 直接在服务器上写入/删除 `WORKSPACE_ROOT` 内的文件 |
-| `ENABLE_SHELL` | _(空=关闭)_ | 设为 `1` 允许 Agent 直接在服务器本机真实执行 shell 命令, 不弹确认框 |
-| `SHELL_TIMEOUT_MS` | `120000` | `ENABLE_SHELL=1` 时单条命令的最长执行时间 (ms) |
-| `SHELL_MAX_OUTPUT_BYTES` | `200000` | `ENABLE_SHELL=1` 时单条命令输出的最大字节数 |
-| `SHELL_FALLBACK_GRACE_MS` | `15000` | 服务端 shell 执行结束后，上游不再推进时的收尾宽限期 (ms) |
-| `STREAM_FIRST_CHUNK_TIMEOUT` | `90000` | 等待首个响应字符的基础超时 (ms)，会按 prompt 长度自适应变长 |
-| `STREAM_FIRST_CHUNK_TIMEOUT_MAX` | `300000` | 首字超时自适应拉长后的绝对上限 (ms) |
-| `STREAM_FIRST_CHUNK_MS_PER_CHAR` | `2` | prompt 每多 1 字符，首字超时增加多少 ms |
-| `STREAM_IDLE_TIMEOUT` | `60000` | 流式响应中两帧之间的最长静默时间 (ms) |
-| `BRIDGE_SESSION_TIMEOUT` | `1800000` | 等待真人在 IDE 里确认执行 (如 shell 确认框) 的最长时间 (ms)，到点不报错，只回收内存 |
+| `STREAM_FIRST_CHUNK_TIMEOUT` | `90000` | 等待首个响应字符的基础超时 (ms) |
+| `STREAM_FIRST_CHUNK_TIMEOUT_MAX` | `300000` | 首字超时的上限 (ms) |
+| `STREAM_FIRST_CHUNK_MS_PER_CHAR` | `2` | prompt 每个字符增加的等待时间 (ms) |
+| `STREAM_IDLE_TIMEOUT` | `60000` | 流式响应中业务数据的空闲超时 (ms) |
 
-上下文会完整转换为 prompt，不做裁剪或重复调用检测；调用方需管理上下文长度。首字超时随 prompt 长度增长，并受 `STREAM_FIRST_CHUNK_TIMEOUT_MAX` 限制。等待客户端执行工具期间暂停首字和空闲计时，`BRIDGE_SESSION_TIMEOUT` 仅用于回收挂起会话；结果回传时若会话已过期，会带完整历史新建会话。
-
-## 🧰 Agent 工具支持 (VSCode Copilot 专用)
-
-VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里会声明它自己支持的工具（`create_file`、`run_in_terminal` 等），并期望模型返回 `tool_calls` 让**它自己**在本地执行，而不是服务器代为执行。桥接需要请求携带 `tools`；未启用桥接时，上游工具请求按服务端工具配置处理。目前桥接针对 `create_file` 和 `run_in_terminal`，不提供任意自定义函数的通用映射。
-
-### 推荐方式：tool_calls 桥接 (`BRIDGE_TOOLS=1`)
-
-开启后，当请求带有 `tools` 字段时，本代理会把 Cursor Agent 内部的"写文件"请求转换成标准的 `create_file` 工具调用交还给 Copilot；Copilot 在**当前打开的项目**里执行完，把结果传回来，代理再喂回 Cursor 的会话继续对话。文件是真的在你本地项目里被创建/修改的，不受服务器 `WORKSPACE_ROOT` 限制。
-
-再加上 `BRIDGE_SHELL=1`，"跑终端命令"也会走同样的桥接：Copilot 会弹出它原生的"允许执行此命令？"确认框，用户确认后命令在**客户端自己的终端**里真实执行。
-
-> **续接方式**：写文件结果优先回传原 Cursor 会话；shell 结果会带完整对话历史新建会话，以避开上游 shell 续接停滞。会话过期或写文件续接失败时，也会尝试新建会话。客户端需在后续请求中保留 `assistant.tool_calls` 和对应的 `role: "tool"` 结果。
-
-### 备用方式：服务端直接处理
-
-不方便走桥接时（比如用 curl/SDK 直接调接口、没有声明 `tools`），也可以让代理自己在**运行本服务的机器**上处理工具请求：
-
-| 工具 | 开关 | 说明 |
-|------|------|------|
-| 读文件 / 列目录 / grep / glob | 默认开启 | 只读，限定在 `WORKSPACE_ROOT` 内；单文件最多读 `CURSOR_TOOL_MAX_READ_BYTES` 字节 (默认 120000)，列目录/搜索最多返回 `CURSOR_TOOL_MAX_LIST_ENTRIES` 条 (默认 200) |
-| 写文件 / 删除文件 | `ENABLE_WRITE=1` | 直接操作服务器磁盘上的 `WORKSPACE_ROOT` |
-| Shell 命令 | `ENABLE_SHELL=1` | 用 `child_process.spawn` 在服务器本机真实执行，不弹确认框 |
-
-> ⚠️ `ENABLE_WRITE=1` / `ENABLE_SHELL=1` 会让模型真实改写文件、真实执行命令。如果代理和你的 VSCode/Cursor 在同一台机器上，这等价于让模型拥有你本机的 shell 权限，请只在信任的本地/内网环境开启。同时开启 `BRIDGE_TOOLS`+`BRIDGE_SHELL` 时会优先走桥接（体验更好，有确认框）；只有调用方没声明 `tools` 时才会退回这里。
-
-服务端直接执行 shell 后，若上游在 `SHELL_FALLBACK_GRACE_MS` 内没有继续推进，会以已捕获的命令输出结束响应，此时可能没有模型对结果的进一步总结。`WORKSPACE_ROOT` 是路径范围配置，不是操作系统级沙箱；只应在可信环境中运行。
+每次请求都将完整文本历史转换为 prompt，不做上下文裁剪。首字超时随 prompt 长度增长，并受上述上限约束。
 
 ## 🗺️ 模型选择
 
@@ -272,7 +230,11 @@ VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里�
 2. 调用 `agent.v1.AgentService/Run` 双向流接口
 3. 处理 Envelope 帧编码 (5 字节头 + JSON payload)
 4. 实时解析 `interactionUpdate` 流并转为 OpenAI SSE 格式
-5. 自动回复/桥接 `execServerMessage`（read/ls/grep/write/shell）
+5. 仅回复上游协议所需的环境信息；收到工具执行请求时结束请求并返回错误
+
+## 测试
+
+运行 `npm test`。测试使用模拟凭据和上游响应，覆盖文本聊天、流式输出、模型名透传、鉴权，以及客户端和上游工具请求的拒绝，不会连接真实账号。
 
 ## 📄 License
 

@@ -4,6 +4,7 @@
   "description": "Cursor IDE Agent API → OpenAI-compatible API proxy (lightweight)",
   "main": "server.js",
   "scripts": {
+    "test": "node --test",
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --env-file-if-exists=.env server.js",
     "sync-token": "node scripts/sync-token.js"
