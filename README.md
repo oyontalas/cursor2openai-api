@@ -19,7 +19,7 @@
 cursor2openai-api/
 ├── server.js              # 入口 (路由 + 启动，全合一)
 ├── src/
-│   ├── config.js          # 配置 & 模型映射
+│   ├── config.js          # 上游连接与默认配置
 │   ├── converter.js       # OpenAI ↔ Cursor 格式转换
 │   └── cursor-client.js   # Cursor Agent API 客户端 (H2 + ConnectRPC)
 ├── scripts/
@@ -148,7 +148,7 @@ curl http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4",
+    "model": "composer-2.5",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 
@@ -157,7 +157,7 @@ curl http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4",
+    "model": "composer-2.5",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -182,7 +182,7 @@ client = OpenAI(
 )
 
 resp = client.chat.completions.create(
-    model="gpt-4",
+    model="composer-2.5",
     messages=[{"role": "user", "content": "你好！"}],
     stream=True
 )
@@ -258,22 +258,11 @@ VSCode Copilot Chat 使用标准 OpenAI `tools`/`tool_calls` 协议：请求里�
 
 服务端直接执行 shell 后，若上游在 `SHELL_FALLBACK_GRACE_MS` 内没有继续推进，会以已捕获的命令输出结束响应，此时可能没有模型对结果的进一步总结。`WORKSPACE_ROOT` 是路径范围配置，不是操作系统级沙箱；只应在可信环境中运行。
 
-## 🗺️ 模型映射
+## 🗺️ 模型选择
 
-传入下列模型别名会映射到配置中的 Cursor 模型；这些名称不代表调用了同名的 OpenAI 模型。可用性以当前账号的 `/v1/models` 返回为准。不传 `model` 时使用 `DEFAULT_MODEL`。
+请求中的 `model` 原样传给 Cursor，不做别名映射或替换。请通过 `/v1/models` 查询当前账号可用的模型 ID，并填入请求；上面的 `composer-2.5` 仅为示例，以实际返回的列表为准。
 
-| 传入 | 映射到 |
-|------|--------|
-| `gpt-4` / `gpt-4o` / `gpt-4-turbo` | `composer-2.5` |
-| `gpt-4o-mini` / `gpt-3.5-turbo` | `composer-2.5-fast` |
-| `claude-3-opus` | `claude-4.6-opus-high` |
-| `claude-3-sonnet` | `claude-4.6-sonnet-medium` |
-| `claude-3.5-sonnet` | `claude-4.5-sonnet` |
-| `gemini-pro` | `gemini-3.1-pro` |
-
-> 💡 也可直接传 Cursor 原生模型名 (如 `composer-2.5`、`claude-4.5-sonnet-thinking`)，会直接透传。
->
-> 📌 响应里的 `model` 字段返回的是**请求使用的 Cursor 模型 ID**（映射后的目标，如 `composer-2.5`），而不是原样回显你传入的别名（如 `gpt-4`），避免造成"以为是某个模型在回答，实际是另一个"的误导。想知道某个别名具体会打到哪个模型，可查上表，或直接看服务端终端日志（会打印 `别名 → 实际模型`）。
+未传 `model` 时使用 `DEFAULT_MODEL`（默认 `claude-4.5-sonnet`）。响应中的 `model` 字段与本次传给上游的模型 ID 一致。
 
 ## 🏗️ 技术原理
 

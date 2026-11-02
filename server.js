@@ -146,8 +146,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     return res.status(503).json(converter.buildErrorResponse('No available tokens', 'server_error', 503));
   }
 
-  const requestedModel = model || DEFAULT_MODEL;
-  const cursorModel = converter.mapModel(requestedModel);
+  const modelId = model || DEFAULT_MODEL;
   const isStream = stream === true;
 
   // 是否是"工具调用结果回传"请求: 消息末尾是连续的 role=tool
@@ -173,7 +172,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     const promptInfo = useFreshSessionForContinuation ? ` | prompt=${prompt.length}字符` : '';
     console.log(`  🔧 [${new Date().toLocaleTimeString()}] tool result ← ${toolMsg.tool_call_id} | ${via}${promptInfo}`);
   } else {
-    console.log(`  📨 [${new Date().toLocaleTimeString()}] ${requestedModel} → ${cursorModel} | stream=${isStream}${bridgeTools ? ' | bridgeTools=on' : ''} | prompt=${prompt.length}字符`);
+    console.log(`  📨 [${new Date().toLocaleTimeString()}] ${modelId} | stream=${isStream}${bridgeTools ? ' | bridgeTools=on' : ''} | prompt=${prompt.length}字符`);
   }
 
   // 统一发起/恢复调用, 返回 { type: 'final', ... } 或 { type: 'tool_calls', toolCalls, sessionId }
@@ -181,16 +180,16 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     if (isToolContinuation) {
       if (useFreshSessionForContinuation) {
         if (pendingKind) cursorClient.discardPendingBridge(toolMsg.tool_call_id);
-        return cursorClient.chat(token, prompt, cursorModel, { ...runtimeOptions, bridgeTools });
+        return cursorClient.chat(token, prompt, modelId, { ...runtimeOptions, bridgeTools });
       }
       return cursorClient.resumeToolCall(toolMsg.tool_call_id, toolMessageContentText(toolMsg), runtimeOptions)
         .catch((err) => {
           // 保底: 就算判断是 'write' 类型, 真续接时也可能因为竞态等原因失败, 同样别让整个对话报错中断
           console.log(`  ↩️  resumeToolCall 失败 (${err.message}), 改为开新会话续接完整上下文`);
-          return cursorClient.chat(token, converter.messagesToPrompt(messages), cursorModel, { ...runtimeOptions, bridgeTools });
+          return cursorClient.chat(token, converter.messagesToPrompt(messages), modelId, { ...runtimeOptions, bridgeTools });
         });
     }
-    return cursorClient.chat(token, prompt, cursorModel, { ...runtimeOptions, bridgeTools });
+    return cursorClient.chat(token, prompt, modelId, { ...runtimeOptions, bridgeTools });
   }
 
   if (isStream) {
@@ -203,7 +202,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
       if (responseDone || res.writableEnded) return;
       responseDone = true;
       if (keepAlive) clearInterval(keepAlive);
-      res.write(converter.buildStreamChunk(null, cursorModel, 'stop'));
+      res.write(converter.buildStreamChunk(null, modelId, 'stop'));
       res.write('data: [DONE]\n\n');
       res.end();
     };
@@ -212,8 +211,8 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
       if (responseDone || res.writableEnded) return;
       responseDone = true;
       if (keepAlive) clearInterval(keepAlive);
-      res.write(converter.buildToolCallStreamChunk(toolCalls, cursorModel));
-      res.write(converter.buildToolCallFinishChunk(cursorModel));
+      res.write(converter.buildToolCallStreamChunk(toolCalls, modelId));
+      res.write(converter.buildToolCallFinishChunk(modelId));
       res.write('data: [DONE]\n\n');
       res.end();
     };
@@ -232,7 +231,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
-    res.write(converter.buildRoleChunk(cursorModel));
+    res.write(converter.buildRoleChunk(modelId));
     keepAlive = setInterval(() => {
       if (!res.writableEnded) res.write(': keep-alive\n\n');
     }, 15000);
@@ -245,7 +244,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
         onDelta: (text) => {
           streamedText += text;
           if (!responseDone && !res.writableEnded) {
-            res.write(converter.buildStreamChunk(text, cursorModel));
+            res.write(converter.buildStreamChunk(text, modelId));
           }
         },
       });
@@ -257,7 +256,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
       }
 
       if (result.error && !responseDone && !res.writableEnded) {
-        res.write(converter.buildStreamChunk(`\n\n[Error: ${result.error}]`, cursorModel));
+        res.write(converter.buildStreamChunk(`\n\n[Error: ${result.error}]`, modelId));
       }
 
       finishStream();
@@ -272,7 +271,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
       } else {
         console.error(`  ❌ stream error: ${e.message}`);
         if (!responseDone && !res.writableEnded) {
-          res.write(converter.buildStreamChunk(`\n\n[Error: ${e.message}]`, cursorModel));
+          res.write(converter.buildStreamChunk(`\n\n[Error: ${e.message}]`, modelId));
         }
         finishStream();
       }
@@ -286,7 +285,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
 
       if (result.type === 'tool_calls') {
         console.log(`  🛠️  paused for tool_calls: ${result.toolCalls.map(tc => tc.name).join(', ')}`);
-        return res.json(converter.buildToolCallChatResponse(result.toolCalls, cursorModel));
+        return res.json(converter.buildToolCallChatResponse(result.toolCalls, modelId));
       }
 
       if (result.error) {
@@ -295,7 +294,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
       }
 
       console.log(`  ✅ done | in=${result.inputTokens} out=${result.outputTokens} out_len=${result.text.length}字符`);
-      res.json(converter.buildChatResponse(result.text, cursorModel, result.inputTokens, result.outputTokens));
+      res.json(converter.buildChatResponse(result.text, modelId, result.inputTokens, result.outputTokens));
     } catch (e) {
       console.error(`  ❌ ${e.message}`);
       res.status(500).json(converter.buildErrorResponse(e.message));

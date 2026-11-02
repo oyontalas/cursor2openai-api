@@ -2,7 +2,6 @@
 //  CursorIDE2API - OpenAI ↔ Cursor 格式转换
 // ═══════════════════════════════════════════════
 
-const config = require('./config');
 const { v4: uuidv4 } = require('uuid');
 
 function messageTextContent(msg) {
@@ -48,20 +47,6 @@ function messagesToPrompt(messages) {
   }
 
   return parts.join('\n\n');
-}
-
-/**
- * 映射模型名称: OpenAI → Cursor
- */
-function mapModel(model) {
-  if (!model) return config.cursor.defaultModel;
-
-  // 先查映射表
-  const mapped = config.modelMapping[model];
-  if (mapped) return mapped;
-
-  // 直通 (假设用户直接传了 Cursor 模型名)
-  return model;
 }
 
 /**
@@ -227,7 +212,7 @@ function buildModelsResponse(cursorModels = []) {
 }
 
 module.exports = {
-  messagesToPrompt, mapModel,
+  messagesToPrompt,
   buildChatResponse, buildStreamChunk, buildRoleChunk,
   buildToolCallChatResponse, buildToolCallStreamChunk, buildToolCallFinishChunk,
   buildErrorResponse, buildModelsResponse,
